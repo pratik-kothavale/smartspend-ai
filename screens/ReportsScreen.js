@@ -1,0 +1,3058 @@
+import DateTimePicker from "@react-native-community/datetimepicker";
+import Feather from "@expo/vector-icons/Feather";
+import MaterialCommunityIcons from "@expo/vector-icons/MaterialCommunityIcons";
+import { useFocusEffect, useNavigation } from "@react-navigation/native";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Constants from "expo-constants";
+import * as WebBrowser from "expo-web-browser";
+import {
+  Alert,
+  Animated,
+  Dimensions,
+  Modal,
+  Platform,
+  Pressable,
+  PanResponder,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
+import Svg, { Circle, G, Line, Path, Rect, Text as SvgText } from "react-native-svg";
+import { supabase } from "../lib/supabase";
+
+const { width } = Dimensions.get("window");
+const SCREEN_PADDING = 16;
+const CARD_WIDTH = width - SCREEN_PADDING * 2;
+const DONUT_CANVAS_WIDTH = Math.min(width - 24, 336);
+const DONUT_CANVAS_MIN_HEIGHT = 212;
+const DONUT_RADIUS = 70;
+const DONUT_CIRCUMFERENCE = 2 * Math.PI * DONUT_RADIUS;
+const CHART_HEIGHT = 210;
+const CHART_TOP_PADDING = 16;
+const CHART_BOTTOM_PADDING = 28;
+const CHART_TOOLTIP_WIDTH = 168;
+const CHART_TOOLTIP_HEIGHT = 96;
+const CHART_TOOLTIP_OFFSET = 14;
+
+function getApiBaseCandidates() {
+  const candidates = [];
+  const configured = process.env.EXPO_PUBLIC_API_URL;
+  if (configured) {
+    candidates.push(configured.replace(/\/+$/, ""));
+  }
+
+  // In Expo Go / dev, default to the same LAN host as Metro.
+  const hostUri =
+    Constants.expoConfig?.hostUri ||
+    Constants.expoConfig?.debuggerHost ||
+    Constants.manifest2?.debuggerHost ||
+    Constants.manifest2?.extra?.expoClient?.hostUri;
+
+  if (typeof hostUri === "string" && hostUri.length) {
+    const host = hostUri.split(":")[0];
+    candidates.push(`http://${host}:3000`);
+  }
+
+  // Fallbacks for common local dev environments.
+  if (Platform.OS === "android") {
+    candidates.push("http://10.0.2.2:3000");
+  }
+  candidates.push("http://localhost:3000");
+
+  return Array.from(new Set(candidates.filter(Boolean)));
+}
+
+// Global helper removed: Moved inside component to access callBackendApi
+
+async function fetchWithTimeout(url, init, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+const RANGE_OPTIONS = [
+  { key: "daily", label: "Daily" },
+  { key: "weekly", label: "Weekly" },
+  { key: "monthly", label: "Monthly" },
+  { key: "yearly", label: "Yearly" },
+];
+const TYPE_OPTIONS = ["income", "expense"];
+
+function formatCurrency(value) {
+  return `₹${Number(value || 0).toFixed(2)}`;
+}
+
+function getNiceChartMax(value) {
+  const amount = Number(value || 0);
+
+  if (amount <= 0) {
+    return 4;
+  }
+
+  const roughStep = amount / 4;
+  const magnitude = 10 ** Math.floor(Math.log10(roughStep));
+  const normalized = roughStep / magnitude;
+
+  let niceStep = magnitude;
+
+  if (normalized > 1 && normalized <= 2) {
+    niceStep = 2 * magnitude;
+  } else if (normalized > 2 && normalized <= 5) {
+    niceStep = 5 * magnitude;
+  } else if (normalized > 5) {
+    niceStep = 10 * magnitude;
+  }
+
+  return niceStep * 4;
+}
+
+function getChartTicks(maxValue, count = 5) {
+  const safeMax = Number(maxValue || 0);
+
+  if (safeMax <= 0) {
+    return [];
+  }
+
+  const intervals = Math.max(count - 1, 1);
+  const roughStep = safeMax / intervals;
+  const magnitude = 10 ** Math.floor(Math.log10(roughStep));
+  const normalized = roughStep / magnitude;
+
+  let niceStep = magnitude;
+
+  if (normalized > 1 && normalized <= 2) {
+    niceStep = 2 * magnitude;
+  } else if (normalized > 2 && normalized <= 5) {
+    niceStep = 5 * magnitude;
+  } else if (normalized > 5) {
+    niceStep = 10 * magnitude;
+  }
+
+  const maxTick = niceStep * intervals;
+  return Array.from({ length: count }, (_, index) => maxTick - niceStep * index);
+}
+
+function formatYAxisCurrency(value) {
+  const amount = Number(value || 0);
+  return `₹${amount.toLocaleString("en-IN", { maximumFractionDigits: 0 })}`;
+}
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function getInteractiveChartState({ data, chartType, chartWidth, maxValue, slotWidth, touchX, touchY }) {
+  if (!data.length) {
+    return null;
+  }
+
+  const innerHeight = CHART_HEIGHT - CHART_TOP_PADDING - CHART_BOTTOM_PADDING;
+  const baselineY = CHART_TOP_PADDING + innerHeight;
+  const safeTouchX = clamp(touchX, 0, chartWidth);
+  const index = clamp(Math.round((safeTouchX - slotWidth / 2) / slotWidth), 0, data.length - 1);
+  const item = data[index];
+  const centerX = slotWidth * index + slotWidth / 2;
+  const barWidth = Math.max(8, Math.min(16, slotWidth * 0.24));
+
+  const incomeY = baselineY - (maxValue > 0 ? (item.income / maxValue) * innerHeight : 0);
+  const expenseY = baselineY - (maxValue > 0 ? (item.expense / maxValue) * innerHeight : 0);
+
+  const incomePoint =
+    chartType === "bar"
+      ? { x: centerX + 2 + barWidth / 2, y: incomeY }
+      : { x: centerX, y: incomeY };
+  const expensePoint =
+    chartType === "bar"
+      ? { x: centerX - barWidth / 2 - 2, y: expenseY }
+      : { x: centerX, y: expenseY };
+
+  const distanceToIncome = Math.hypot(safeTouchX - incomePoint.x, touchY - incomePoint.y);
+  const distanceToExpense = Math.hypot(safeTouchX - expensePoint.x, touchY - expensePoint.y);
+  const selectedSeries = distanceToIncome <= distanceToExpense ? "income" : "expense";
+  const activePoint = selectedSeries === "income" ? incomePoint : expensePoint;
+  const activeValue = selectedSeries === "income" ? item.income : item.expense;
+  const activeColor = selectedSeries === "income" ? "#7dd56c" : "#f46872";
+
+  const tooltipLeft = clamp(
+    centerX - CHART_TOOLTIP_WIDTH / 2,
+    8,
+    Math.max(chartWidth - CHART_TOOLTIP_WIDTH - 8, 8)
+  );
+  const preferredTop = activePoint.y - CHART_TOOLTIP_HEIGHT - CHART_TOOLTIP_OFFSET;
+  const tooltipTop =
+    preferredTop < 8
+      ? clamp(activePoint.y + CHART_TOOLTIP_OFFSET, 8, CHART_HEIGHT - CHART_TOOLTIP_HEIGHT - 8)
+      : clamp(preferredTop, 8, CHART_HEIGHT - CHART_TOOLTIP_HEIGHT - 8);
+
+  return {
+    activeColor,
+    activePoint,
+    activeSeries: selectedSeries,
+    activeValue,
+    centerX,
+    expensePoint,
+    incomePoint,
+    item,
+    tooltipLeft,
+    tooltipTop,
+  };
+}
+
+function parseStoredDate(value) {
+  const [year, month, day] = String(value || "").split("-").map(Number);
+  return new Date(year || 2000, (month || 1) - 1, day || 1);
+}
+
+function formatDateKey(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function formatDateLabel(date) {
+  return date.toLocaleDateString("en-US", { day: "numeric", month: "short", year: "numeric" });
+}
+
+function getStartOfWeek(dateValue) {
+  const date = new Date(dateValue);
+  date.setHours(0, 0, 0, 0);
+  const day = date.getDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  date.setDate(date.getDate() + diff);
+  return date;
+}
+
+function getEndOfWeek(dateValue) {
+  const date = getStartOfWeek(dateValue);
+  date.setDate(date.getDate() + 6);
+  return date;
+}
+
+function buildGroupKey(date, grouping) {
+  if (grouping === "daily") {
+    return formatDateKey(date);
+  }
+
+  if (grouping === "weekly") {
+    return `week-${formatDateKey(getStartOfWeek(date))}`;
+  }
+
+  if (grouping === "monthly") {
+    return `month-${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+  }
+
+  return `year-${date.getFullYear()}`;
+}
+
+function buildGroupLabel(date, grouping) {
+  if (grouping === "daily") {
+    return `${date.getDate()}/${date.getMonth() + 1}/${date.getFullYear()}`;
+  }
+
+  if (grouping === "weekly") {
+    const start = getStartOfWeek(date);
+    const end = getEndOfWeek(date);
+    const startLabel = start.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+    const endLabel =
+      start.getMonth() === end.getMonth()
+        ? end.toLocaleDateString("en-US", { day: "numeric" })
+        : end.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+    return `${startLabel}-${endLabel}`;
+  }
+
+  if (grouping === "monthly") {
+    return date.toLocaleDateString("en-US", { month: "short", year: "2-digit" });
+  }
+
+  return String(date.getFullYear());
+}
+
+function getYearBounds(year) {
+  return {
+    start: new Date(year, 0, 1),
+    end: new Date(year, 11, 31),
+  };
+}
+
+function getGroupBounds(dateValue, grouping) {
+  const date = new Date(dateValue);
+  date.setHours(0, 0, 0, 0);
+
+  if (grouping === "daily") {
+    return { start: date, end: date };
+  }
+
+  if (grouping === "weekly") {
+    return { start: getStartOfWeek(date), end: getEndOfWeek(date) };
+  }
+
+  if (grouping === "monthly") {
+    const start = new Date(date.getFullYear(), date.getMonth(), 1);
+    const end = new Date(date.getFullYear(), date.getMonth() + 1, 0);
+    return { start, end };
+  }
+
+  return {
+    start: new Date(date.getFullYear(), 0, 1),
+    end: new Date(date.getFullYear(), 11, 31),
+  };
+}
+
+function buildGroupedSeries(transactions, grouping) {
+  const groups = new Map();
+
+  transactions.forEach((transaction) => {
+    const date = parseStoredDate(transaction.date);
+    const key = buildGroupKey(date, grouping);
+
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        date,
+        label: buildGroupLabel(date, grouping),
+        income: 0,
+        expense: 0,
+        total: 0,
+        count: 0,
+      });
+    }
+
+    const group = groups.get(key);
+    const amount = Number(transaction.amount || 0);
+
+    if (transaction.type === "income") {
+      group.income += amount;
+    } else if (transaction.type === "expense") {
+      group.expense += amount;
+    }
+
+    group.total += amount;
+    group.count += 1;
+  });
+
+  return Array.from(groups.values()).sort((left, right) => left.date - right.date);
+}
+
+function addDays(dateValue, days) {
+  const date = new Date(dateValue);
+  date.setDate(date.getDate() + days);
+  return date;
+}
+
+function filterTransactionsByBounds(transactions, startDate, endDate) {
+  const startKey = formatDateKey(startDate);
+  const endKey = formatDateKey(endDate);
+  return transactions.filter((transaction) => transaction.date >= startKey && transaction.date <= endKey);
+}
+
+function buildChartSeriesForRange(transactions, range, periodStart, periodEnd) {
+  if (range === "daily") {
+    const buckets = Array.from({ length: 24 }, (_, hour) => ({
+      key: `hour-${hour}`,
+      label: [0, 6, 12, 18, 23].includes(hour) ? `${String(hour).padStart(2, "0")}:00` : "",
+      shortLabel: `${String(hour).padStart(2, "0")}:00`,
+      income: 0,
+      expense: 0,
+    }));
+
+    transactions.forEach((transaction) => {
+      const hour = Number(String(transaction.time || "00:00:00").split(":")[0] || 0);
+      const amount = Number(transaction.amount || 0);
+
+      if (transaction.type === "income") {
+        buckets[hour].income += amount;
+      } else if (transaction.type === "expense") {
+        buckets[hour].expense += amount;
+      }
+    });
+
+    return buckets;
+  }
+
+  if (range === "weekly") {
+    const days = [];
+
+    for (let index = 0; index < 7; index += 1) {
+      const date = addDays(getStartOfWeek(periodStart), index);
+      const dayTransactions = filterTransactionsByBounds(transactions, date, date);
+
+      days.push({
+        key: formatDateKey(date),
+        label: date.toLocaleDateString("en-US", { weekday: "short" }),
+        shortLabel: date.toLocaleDateString("en-US", { weekday: "short" }),
+        income: dayTransactions
+          .filter((item) => item.type === "income")
+          .reduce((sum, item) => sum + Number(item.amount || 0), 0),
+        expense: dayTransactions
+          .filter((item) => item.type === "expense")
+          .reduce((sum, item) => sum + Number(item.amount || 0), 0),
+      });
+    }
+
+    return days;
+  }
+
+  if (range === "monthly") {
+    const days = [];
+    const start = new Date(periodStart.getFullYear(), periodStart.getMonth(), 1);
+    const end = new Date(periodStart.getFullYear(), periodStart.getMonth() + 1, 0);
+
+    for (let cursor = new Date(start); cursor <= end; cursor = addDays(cursor, 1)) {
+      const dayTransactions = filterTransactionsByBounds(transactions, cursor, cursor);
+      const dayOfMonth = cursor.getDate();
+
+      days.push({
+        key: formatDateKey(cursor),
+        label: [1, 7, 13, 19, 25, 31].includes(dayOfMonth) ? String(dayOfMonth) : "",
+        shortLabel: String(dayOfMonth),
+        income: dayTransactions
+          .filter((item) => item.type === "income")
+          .reduce((sum, item) => sum + Number(item.amount || 0), 0),
+        expense: dayTransactions
+          .filter((item) => item.type === "expense")
+          .reduce((sum, item) => sum + Number(item.amount || 0), 0),
+      });
+    }
+
+    return days;
+  }
+
+  const months = [];
+  const start = new Date(periodStart.getFullYear(), 0, 1);
+
+  for (let month = 0; month < 12; month += 1) {
+    const monthStart = new Date(start.getFullYear(), month, 1);
+    const monthEnd = new Date(start.getFullYear(), month + 1, 0);
+    const monthTransactions = filterTransactionsByBounds(transactions, monthStart, monthEnd);
+    const label = monthStart.toLocaleDateString("en-US", { month: "short" });
+
+    months.push({
+      key: `${monthStart.getFullYear()}-${month + 1}`,
+      label: month % 2 === 0 ? label : "",
+      shortLabel: label,
+      income: monthTransactions
+        .filter((item) => item.type === "income")
+        .reduce((sum, item) => sum + Number(item.amount || 0), 0),
+      expense: monthTransactions
+        .filter((item) => item.type === "expense")
+        .reduce((sum, item) => sum + Number(item.amount || 0), 0),
+    });
+  }
+
+  return months;
+}
+
+function isLastDayOfMonth(date) {
+  return date.getDate() === new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
+}
+
+function isFullMonthSpan(periodStart, periodEnd) {
+  const start = new Date(periodStart);
+  const end = new Date(periodEnd);
+  return start.getDate() === 1 && isLastDayOfMonth(end) && start.getFullYear() === end.getFullYear() && start.getMonth() === end.getMonth();
+}
+
+function isFullYearSpan(periodStart, periodEnd) {
+  const start = new Date(periodStart);
+  const end = new Date(periodEnd);
+  return start.getMonth() === 0 && start.getDate() === 1 && end.getMonth() === 11 && end.getDate() === 31 && start.getFullYear() === end.getFullYear();
+}
+
+function isFullWeekSpan(periodStart, periodEnd) {
+  const start = getStartOfWeek(periodStart);
+  const end = getEndOfWeek(periodStart);
+  return formatDateKey(start) === formatDateKey(periodStart) && formatDateKey(end) === formatDateKey(periodEnd);
+}
+
+function getChartLabelDate(periodStart, periodEnd, index, binCount, range) {
+  if (binCount <= 1) {
+    return new Date(periodStart);
+  }
+
+  const start = new Date(periodStart);
+  const end = new Date(periodEnd);
+  start.setHours(0, 0, 0, 0);
+  end.setHours(0, 0, 0, 0);
+
+  if (range === "daily") {
+    end.setHours(24, 0, 0, 0);
+  } else {
+    end.setHours(23, 59, 59, 999);
+  }
+
+  const ratio = index / (binCount - 1);
+  return new Date(start.getTime() + (end.getTime() - start.getTime()) * ratio);
+}
+
+function formatChartAxisLabel({ range, periodStart, periodEnd, index, binCount }) {
+  const labelDate = getChartLabelDate(periodStart, periodEnd, index, binCount, range);
+  const isFirst = index === 0;
+  const isLast = index === binCount - 1;
+  const fullWeek = isFullWeekSpan(periodStart, periodEnd);
+  const fullMonth = isFullMonthSpan(periodStart, periodEnd);
+  const fullYear = isFullYearSpan(periodStart, periodEnd);
+
+  if (range === "daily") {
+    if (isFirst) return "00:00";
+    if (isLast) return "24:00";
+    return `${String(labelDate.getHours()).padStart(2, "0")}:00`;
+  }
+
+  if (range === "weekly") {
+    if (isFirst) return fullWeek ? formatDateLabel(new Date(periodStart)) : formatDateLabel(labelDate);
+    if (isLast) return fullWeek ? formatDateLabel(new Date(periodEnd)) : formatDateLabel(labelDate);
+    return labelDate.toLocaleDateString("en-US", { weekday: "short", day: "numeric" });
+  }
+
+  if (range === "monthly") {
+    if (isFirst) return fullMonth ? "1" : formatDateLabel(labelDate);
+    if (isLast) return fullMonth ? String(new Date(periodEnd).getDate()) : formatDateLabel(labelDate);
+    return String(labelDate.getDate());
+  }
+
+  if (range === "yearly") {
+    if (isFirst) return fullYear ? "Jan" : formatDateLabel(labelDate);
+    if (isLast) return fullYear ? "Dec" : formatDateLabel(labelDate);
+    return labelDate.toLocaleDateString("en-US", { month: "short" });
+  }
+
+  if (isFirst || isLast) {
+    return formatDateLabel(labelDate);
+  }
+
+  return labelDate.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+function buildAdaptiveChartSeries(series, range, periodStart, periodEnd, targetPoints = 5) {
+  const safeSeries = Array.isArray(series) ? series : [];
+  if (safeSeries.length <= targetPoints) {
+    return safeSeries.map((item, index) => {
+      return {
+        ...item,
+        axisLabel: formatChartAxisLabel({
+          range,
+          periodStart,
+          periodEnd,
+          index,
+          binCount: safeSeries.length,
+        }),
+      };
+    });
+  }
+
+  const binCount = Math.min(targetPoints, safeSeries.length);
+  const baseSize = Math.floor(safeSeries.length / binCount);
+  const remainder = safeSeries.length % binCount;
+  const bins = [];
+  let cursor = 0;
+
+  for (let binIndex = 0; binIndex < binCount; binIndex += 1) {
+    const binSize = baseSize + (binIndex < remainder ? 1 : 0);
+    const chunk = safeSeries.slice(cursor, cursor + binSize);
+    cursor += binSize;
+
+    if (!chunk.length) {
+      continue;
+    }
+
+    const startItem = chunk[0];
+    const endItem = chunk[chunk.length - 1];
+    const income = chunk.reduce((sum, item) => sum + Number(item.income || 0), 0);
+    const expense = chunk.reduce((sum, item) => sum + Number(item.expense || 0), 0);
+    const label = startItem.shortLabel || startItem.label || startItem.key;
+
+    bins.push({
+      key: `${startItem.key}-${endItem.key}`,
+      label,
+      shortLabel: label,
+      income,
+      expense,
+      sourceRange: {
+        start: startItem.label || startItem.shortLabel || startItem.key,
+        end: endItem.label || endItem.shortLabel || endItem.key,
+      },
+      axisLabel: formatChartAxisLabel({
+        range,
+        periodStart,
+        periodEnd,
+        index: binIndex,
+        binCount,
+      }),
+    });
+  }
+
+  return bins;
+}
+
+function buildCategoryBreakdown(transactions, type) {
+  const bucket = {};
+
+  transactions
+    .filter((transaction) => transaction.type === type)
+    .forEach((transaction) => {
+      const key = transaction.category_id || transaction.categories?.name || "other";
+
+      if (!bucket[key]) {
+        bucket[key] = {
+          key,
+          categoryId: transaction.category_id || null,
+          category: transaction.categories || null,
+          name: transaction.categories?.name || (type === "income" ? "Income" : "Others"),
+          icon: transaction.categories?.icon || "tag",
+          color: transaction.categories?.color || (type === "income" ? "#eb727b" : "#6db2ec"),
+          total: 0,
+          count: 0,
+        };
+      }
+
+      bucket[key].total += Number(transaction.amount || 0);
+      bucket[key].count += 1;
+    });
+
+  const items = Object.values(bucket).sort((left, right) => right.total - left.total);
+  const total = items.reduce((sum, item) => sum + item.total, 0);
+
+  return items.map((item, index) => ({
+    ...item,
+    percentage: total > 0 ? (item.total / total) * 100 : 0,
+    color: item.color || DEFAULT_CHART_COLORS[index % DEFAULT_CHART_COLORS.length],
+  }));
+}
+
+function buildDonutSegments(items) {
+  let cumulativeFraction = 0;
+
+  return items.map((item) => {
+    const fraction = item.percentage / 100;
+    const segment = {
+      ...item,
+      fraction,
+      strokeDasharray: `${DONUT_CIRCUMFERENCE * fraction} ${DONUT_CIRCUMFERENCE}`,
+      strokeDashoffset: DONUT_CIRCUMFERENCE * (1 - cumulativeFraction),
+    };
+    cumulativeFraction += fraction;
+    return segment;
+  });
+}
+
+function getSegmentLabelPoint(segments, segmentKey, centerX, centerY, radius) {
+  const index = segments.findIndex((item) => item.key === segmentKey);
+  const angleBefore = segments
+    .slice(0, index)
+    .reduce((sum, item) => sum + item.fraction * 360, -90);
+  const midAngle = angleBefore + segments[index].fraction * 180;
+  const radians = (midAngle * Math.PI) / 180;
+
+  return {
+    x: centerX + radius * Math.cos(radians),
+    y: centerY + radius * Math.sin(radians),
+  };
+}
+
+function getLabelTextStyle(name, totalSegments = 0) {
+  if (totalSegments >= 12) {
+    if (name.length > 12) {
+      return { fontSize: 10, text: `${name.slice(0, 10)}..` };
+    }
+
+    return { fontSize: 10, text: name };
+  }
+
+  if (totalSegments >= 10) {
+    if (name.length > 14) {
+      return { fontSize: 11, text: `${name.slice(0, 11)}..` };
+    }
+
+    return { fontSize: 11, text: name };
+  }
+
+  if (totalSegments >= 7) {
+    if (name.length > 15) {
+      return { fontSize: 12, text: `${name.slice(0, 12)}..` };
+    }
+
+    return { fontSize: 12, text: name };
+  }
+
+  if (name.length > 18) {
+    return { fontSize: 12, text: `${name.slice(0, 15)}...` };
+  }
+
+  if (name.length > 13) {
+    return { fontSize: 13, text: name };
+  }
+
+  return { fontSize: 14, text: name };
+}
+
+function groupSegmentsBySide(segments) {
+  const orderedSegments = [...segments].sort(
+    (leftSegment, rightSegment) =>
+      Math.sin((getSegmentMidAngle(segments, leftSegment.key) * Math.PI) / 180) -
+      Math.sin((getSegmentMidAngle(segments, rightSegment.key) * Math.PI) / 180)
+  );
+
+  const left = orderedSegments.filter(
+    (segment) => Math.cos((getSegmentMidAngle(segments, segment.key) * Math.PI) / 180) < 0
+  );
+  const right = orderedSegments.filter(
+    (segment) => Math.cos((getSegmentMidAngle(segments, segment.key) * Math.PI) / 180) >= 0
+  );
+
+  const moveClosestToCenter = (from, to) => {
+    if (!from.length) {
+      return;
+    }
+
+    const sourceIndex = from.reduce((bestIndex, segment, index) => {
+      const currentDistance = Math.abs(
+        Math.sin((getSegmentMidAngle(segments, segment.key) * Math.PI) / 180)
+      );
+      const bestDistance = Math.abs(
+        Math.sin((getSegmentMidAngle(segments, from[bestIndex].key) * Math.PI) / 180)
+      );
+
+      return currentDistance < bestDistance ? index : bestIndex;
+    }, 0);
+
+    to.push(from[sourceIndex]);
+    from.splice(sourceIndex, 1);
+  };
+
+  while (left.length - right.length > 1) {
+    moveClosestToCenter(left, right);
+  }
+
+  while (right.length - left.length > 1) {
+    moveClosestToCenter(right, left);
+  }
+
+  left.sort(
+    (leftSegment, rightSegment) =>
+      Math.sin((getSegmentMidAngle(segments, leftSegment.key) * Math.PI) / 180) -
+      Math.sin((getSegmentMidAngle(segments, rightSegment.key) * Math.PI) / 180)
+  );
+  right.sort(
+    (leftSegment, rightSegment) =>
+      Math.sin((getSegmentMidAngle(segments, leftSegment.key) * Math.PI) / 180) -
+      Math.sin((getSegmentMidAngle(segments, rightSegment.key) * Math.PI) / 180)
+  );
+
+  return { left, right };
+}
+
+function getSegmentMidAngle(segments, segmentKey) {
+  const index = segments.findIndex((item) => item.key === segmentKey);
+  const angleBefore = segments
+    .slice(0, index)
+    .reduce((sum, item) => sum + item.fraction * 360, -90);
+  return angleBefore + segments[index].fraction * 180;
+}
+
+function polarToCartesian(centerX, centerY, radius, angleInDegrees) {
+  const angleInRadians = ((angleInDegrees - 90) * Math.PI) / 180.0;
+
+  return {
+    x: centerX + radius * Math.cos(angleInRadians),
+    y: centerY + radius * Math.sin(angleInRadians),
+  };
+}
+
+function createDonutArcPath(centerX, centerY, outerRadius, innerRadius, startAngle, endAngle) {
+  const clampedEndAngle = endAngle - startAngle >= 359.999 ? startAngle + 359.999 : endAngle;
+  const startOuter = polarToCartesian(centerX, centerY, outerRadius, startAngle);
+  const endOuter = polarToCartesian(centerX, centerY, outerRadius, clampedEndAngle);
+  const startInner = polarToCartesian(centerX, centerY, innerRadius, startAngle);
+  const endInner = polarToCartesian(centerX, centerY, innerRadius, clampedEndAngle);
+  const largeArcFlag = clampedEndAngle - startAngle <= 180 ? "0" : "1";
+
+  return [
+    `M ${startOuter.x} ${startOuter.y}`,
+    `A ${outerRadius} ${outerRadius} 0 ${largeArcFlag} 1 ${endOuter.x} ${endOuter.y}`,
+    `L ${endInner.x} ${endInner.y}`,
+    `A ${innerRadius} ${innerRadius} 0 ${largeArcFlag} 0 ${startInner.x} ${startInner.y}`,
+    "Z",
+  ].join(" ");
+}
+
+const DEFAULT_CHART_COLORS = ["#6db2ec", "#eb727b", "#54b7b4", "#a58374", "#8d7bf7", "#ffb36b"];
+
+function createLinePoints(values) {
+  return values.map((point) => `${point.x},${point.y}`).join(" ");
+}
+
+function createSmoothLinePath(points) {
+  if (!points.length) {
+    return "";
+  }
+
+  if (points.length === 1) {
+    return `M ${points[0].x},${points[0].y}`;
+  }
+
+  let path = `M ${points[0].x},${points[0].y}`;
+
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const current = points[index];
+    const next = points[index + 1];
+    const controlX = (current.x + next.x) / 2;
+
+    path += ` C ${controlX},${current.y} ${controlX},${next.y} ${next.x},${next.y}`;
+  }
+
+  return path;
+}
+
+function BarChart({ data, chartWidth, maxValue, slotWidth, interaction }) {
+  const innerHeight = CHART_HEIGHT - CHART_TOP_PADDING - CHART_BOTTOM_PADDING;
+  const barWidth = Math.max(8, Math.min(16, slotWidth * 0.24));
+
+  return (
+    <Svg width={chartWidth} height={CHART_HEIGHT}>
+      {[0.25, 0.5, 0.75, 1].map((ratio) => {
+        const y = CHART_TOP_PADDING + innerHeight * ratio;
+        return <Line key={ratio} x1="0" y1={y} x2={chartWidth} y2={y} stroke="#4a332d" strokeWidth="1" />;
+      })}
+
+      {data.map((item, index) => {
+        const xCenter = slotWidth * index + slotWidth / 2;
+        const expenseHeight = maxValue > 0 ? (item.expense / maxValue) * innerHeight : 0;
+        const incomeHeight = maxValue > 0 ? (item.income / maxValue) * innerHeight : 0;
+
+        return (
+          <G key={item.key}>
+            <Rect
+              x={xCenter - barWidth - 2}
+              y={CHART_TOP_PADDING + innerHeight - expenseHeight}
+              width={barWidth}
+              height={Math.max(expenseHeight, item.expense > 0 ? 4 : 0)}
+              rx="4"
+              fill="#f46872"
+            />
+            <Rect
+              x={xCenter + 2}
+              y={CHART_TOP_PADDING + innerHeight - incomeHeight}
+              width={barWidth}
+              height={Math.max(incomeHeight, item.income > 0 ? 4 : 0)}
+              rx="4"
+              fill="#7dd56c"
+            />
+          </G>
+        );
+      })}
+
+      {interaction ? (
+        <>
+          <Line
+            x1={interaction.centerX}
+            y1={CHART_TOP_PADDING}
+            x2={interaction.centerX}
+            y2={CHART_TOP_PADDING + innerHeight}
+            stroke={interaction.activeColor}
+            strokeOpacity="0.28"
+            strokeWidth="2"
+            strokeDasharray="5 6"
+          />
+          <Circle
+            cx={interaction.activePoint.x}
+            cy={interaction.activePoint.y}
+            r="8"
+            fill={interaction.activeColor}
+            fillOpacity="0.16"
+          />
+          <Circle
+            cx={interaction.activePoint.x}
+            cy={interaction.activePoint.y}
+            r="4"
+            fill="#f7eee8"
+            stroke={interaction.activeColor}
+            strokeWidth="2"
+          />
+        </>
+      ) : null}
+    </Svg>
+  );
+}
+
+function LineChart({ data, chartWidth, maxValue, slotWidth, interaction }) {
+  const innerHeight = CHART_HEIGHT - CHART_TOP_PADDING - CHART_BOTTOM_PADDING;
+  const baselineY = CHART_TOP_PADDING + innerHeight;
+  const incomePlotPoints = data.map((item, index) => ({
+    x: slotWidth * index + slotWidth / 2,
+    y: baselineY - (maxValue > 0 ? (item.income / maxValue) * innerHeight : 0),
+  }));
+  const expensePlotPoints = data.map((item, index) => ({
+    x: slotWidth * index + slotWidth / 2,
+    y: baselineY - (maxValue > 0 ? (item.expense / maxValue) * innerHeight : 0),
+  }));
+  const incomePoints = createLinePoints(incomePlotPoints);
+  const expensePoints = createLinePoints(expensePlotPoints);
+  const incomeSmoothPath = createSmoothLinePath(incomePlotPoints);
+  const expenseSmoothPath = createSmoothLinePath(expensePlotPoints);
+
+  return (
+    <Svg width={chartWidth} height={CHART_HEIGHT}>
+      {[0.25, 0.5, 0.75, 1].map((ratio) => {
+        const y = CHART_TOP_PADDING + innerHeight * ratio;
+        return <Line key={ratio} x1="0" y1={y} x2={chartWidth} y2={y} stroke="#4a332d" strokeWidth="1" />;
+      })}
+
+      {incomePoints ? (
+        <>
+          <Path
+            d={incomeSmoothPath}
+            fill="none"
+            stroke="#7dd56c"
+            strokeWidth="3"
+            strokeLinejoin="round"
+            strokeLinecap="round"
+            strokeOpacity="0.88"
+          />
+          {incomePlotPoints.map((point, index) => {
+            const item = data[index];
+            if (item.income <= 0) {
+              return null;
+            }
+
+            return <Circle key={`${item.key}-income`} cx={point.x} cy={point.y} r="3" fill="#7dd56c" />;
+          })}
+        </>
+      ) : null}
+
+      {expensePoints ? (
+        <>
+          <Path
+            d={expenseSmoothPath}
+            fill="none"
+            stroke="#f46872"
+            strokeWidth="3"
+            strokeLinejoin="round"
+            strokeLinecap="round"
+            strokeOpacity="0.88"
+          />
+          {expensePlotPoints.map((point, index) => {
+            const item = data[index];
+            if (item.expense <= 0) {
+              return null;
+            }
+
+            return <Circle key={`${item.key}-expense`} cx={point.x} cy={point.y} r="3" fill="#f46872" />;
+          })}
+        </>
+      ) : null}
+
+      {interaction ? (
+        <>
+          <Line
+            x1={interaction.centerX}
+            y1={CHART_TOP_PADDING}
+            x2={interaction.centerX}
+            y2={baselineY}
+            stroke={interaction.activeColor}
+            strokeOpacity="0.28"
+            strokeWidth="2"
+            strokeDasharray="5 6"
+          />
+          <Circle
+            cx={interaction.activePoint.x}
+            cy={interaction.activePoint.y}
+            r="9"
+            fill={interaction.activeColor}
+            fillOpacity="0.16"
+          />
+          <Circle
+            cx={interaction.activePoint.x}
+            cy={interaction.activePoint.y}
+            r="4"
+            fill="#f7eee8"
+            stroke={interaction.activeColor}
+            strokeWidth="2"
+          />
+        </>
+      ) : null}
+    </Svg>
+  );
+}
+
+function DonutChart({ items, total, selectedType }) {
+  const segments = buildDonutSegments(items);
+  const { left, right } = groupSegmentsBySide(segments);
+  const donutCanvasHeight = Math.max(DONUT_CANVAS_MIN_HEIGHT + 40, Math.max(left.length, right.length) * 28 + 90);
+  const centerX = DONUT_CANVAS_WIDTH / 2;
+  const centerY = donutCanvasHeight / 2;
+  const LOCAL_DONUT_RADIUS = 74;
+  const outerRadius = LOCAL_DONUT_RADIUS + 4;
+  const innerRadius = LOCAL_DONUT_RADIUS - 30;
+  const gapAngle = 0;
+
+  if (!segments.length || total <= 0) {
+    return (
+      <View style={styles.emptyDonut}>
+        <MaterialCommunityIcons name="chart-donut-variant" size={54} color="#8c7066" />
+        <Text style={styles.emptyDonutText}>No {selectedType} data</Text>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.donutWrap}>
+      <Svg width={DONUT_CANVAS_WIDTH} height={donutCanvasHeight}>
+        {segments.length === 1 ? (
+          <Circle cx={centerX} cy={centerY} r={outerRadius} fill={segments[0].color} />
+        ) : (
+          segments.map((segment, index) => {
+            const rawStartAngle =
+              segments.slice(0, index).reduce((sum, item) => sum + item.fraction * 360, 0);
+            const rawEndAngle = rawStartAngle + segment.fraction * 360;
+            const startAngle = rawStartAngle + gapAngle / 2;
+            const endAngle = rawEndAngle - gapAngle / 2;
+
+            return (
+              <Path
+                key={segment.key}
+                d={createDonutArcPath(centerX, centerY, outerRadius, innerRadius, startAngle, endAngle)}
+                fill={segment.color}
+              />
+            );
+          })
+        )}
+
+        <Circle cx={centerX} cy={centerY} r={innerRadius - 2} fill="#382721" />
+
+        {(() => {
+          const labels = segments.map((segment, index) => {
+            const angleBefore = segments.slice(0, index).reduce((sum, item) => sum + item.fraction * 360, -90);
+            const trueMidAngle = angleBefore + segment.fraction * 180;
+            return { segment, trueMidAngle, renderAngle: trueMidAngle };
+          });
+
+          const minAngleGap = labels.length > 8 ? 16 : 22;
+          for (let iter = 0; iter < 50; iter++) {
+            for (let i = 0; i < labels.length - 1; i++) {
+              for (let j = i + 1; j < labels.length; j++) {
+                let diff = labels[j].renderAngle - labels[i].renderAngle;
+                if (Math.abs(diff) < minAngleGap) {
+                  const push = (minAngleGap - Math.abs(diff)) / 2;
+                  if (diff > 0) {
+                     labels[i].renderAngle -= push;
+                     labels[j].renderAngle += push;
+                  } else {
+                     labels[i].renderAngle += push;
+                     labels[j].renderAngle -= push;
+                  }
+                }
+              }
+            }
+          }
+
+          const boxes = labels.map((label) => {
+            const trueRadians = (label.trueMidAngle * Math.PI) / 180;
+            const renderRadians = (label.renderAngle * Math.PI) / 180;
+
+            const point = {
+              x: centerX + (outerRadius + 3) * Math.cos(trueRadians),
+              y: centerY + (outerRadius + 3) * Math.sin(trueRadians),
+            };
+
+            const labelRadius = outerRadius + 28;
+            let textX = centerX + labelRadius * Math.cos(renderRadians);
+            let textY = centerY + labelRadius * Math.sin(renderRadians);
+
+            const isTopOrBottom = Math.abs(Math.sin(renderRadians)) > 0.85;
+            let textAnchor = "middle";
+            if (!isTopOrBottom) {
+              textAnchor = Math.cos(renderRadians) >= 0 ? "start" : "end";
+            }
+            if (textAnchor === "start") textX += 6;
+            if (textAnchor === "end") textX -= 6;
+            
+            return { ...label, point, textX, textY, textAnchor };
+          });
+          
+          const resolveOverlap = (overlapBoxes) => {
+            const PAD_Y = 34;
+            const PAD_X = 72; 
+            for (let iter = 0; iter < 500; iter++) {
+              let moved = false;
+              for (let i = 0; i < overlapBoxes.length; i++) {
+                for (let j = i + 1; j < overlapBoxes.length; j++) {
+                  const b1 = overlapBoxes[i];
+                  const b2 = overlapBoxes[j];
+                  
+                  // Calculate TRUE visual center of text
+                  const cx1 = b1.textAnchor === "start" ? b1.textX + 36 : b1.textAnchor === "end" ? b1.textX - 36 : b1.textX;
+                  const cx2 = b2.textAnchor === "start" ? b2.textX + 36 : b2.textAnchor === "end" ? b2.textX - 36 : b2.textX;
+                  const cy1 = b1.textY;
+                  const cy2 = b2.textY;
+
+                  const dy = cy1 - cy2;
+                  const dx = cx1 - cx2;
+                  
+                  if (Math.abs(dy) < PAD_Y && Math.abs(dx) < PAD_X) {
+                    moved = true;
+                    const overlapY = PAD_Y - Math.abs(dy);
+                    const overlapX = PAD_X - Math.abs(dx);
+                    
+                    if (overlapY < overlapX * 0.5) {
+                      const pushY = overlapY / 2;
+                      if (dy < 0) { b1.textY -= pushY; b2.textY += pushY; }
+                      else { b1.textY += pushY; b2.textY -= pushY; }
+                    } else {
+                      const pushX = overlapX / 2;
+                      if (dx < 0) { b1.textX -= pushX; b2.textX += pushX; }
+                      else { b1.textX += pushX; b2.textX -= pushX; }
+                    }
+                  }
+                }
+              }
+              if (!moved) break;
+            }
+          };
+          
+          resolveOverlap(boxes);
+
+          boxes.forEach((box) => {
+             box.textY = Math.max(16, Math.min(donutCanvasHeight - 20, box.textY));
+             box.textX = Math.max(30, Math.min(DONUT_CANVAS_WIDTH - 30, box.textX));
+          });
+          
+          return boxes.map(({ segment, point, textX, textY, textAnchor }) => {
+
+            const nameStyle = getLabelTextStyle(segment.name, segments.length);
+            const percentFontSize = segments.length >= 12 ? "10" : segments.length >= 9 ? "11" : "13";
+            const connectorEndX = textAnchor === "start" ? textX - 4 : textAnchor === "end" ? textX + 4 : textX;
+
+            return (
+              <G key={`${segment.key}-label`}>
+                <Path
+                  d={`M ${point.x} ${point.y} Q ${point.x + (connectorEndX - point.x) / 2} ${point.y} ${connectorEndX} ${textY - 3}`}
+                  fill="none"
+                  stroke={segment.color}
+                  strokeWidth="1.5"
+                />
+                <SvgText
+                  x={textX}
+                  y={textY - 7}
+                  fill="#ffffff"
+                  fontSize={nameStyle.fontSize}
+                  fontWeight="700"
+                  textAnchor={textAnchor}
+                >
+                  {nameStyle.text}
+                </SvgText>
+                <SvgText
+                  x={textX}
+                  y={textY + 8}
+                  fill="#ffffff"
+                  fontSize={percentFontSize}
+                  fontWeight="700"
+                  textAnchor={textAnchor}
+                >
+                  {`${Math.round(segment.percentage)}%`}
+                </SvgText>
+              </G>
+            );
+          });
+        })()}
+      </Svg>
+
+    </View>
+  );
+}
+
+function FilterSheet({
+  visible,
+  draftAccountIds,
+  draftCategoryIds,
+  draftEndDate,
+  draftRange,
+  draftStartDate,
+  accounts,
+  categories,
+  onApply,
+  onClose,
+  onOpenDatePicker,
+  onToggleAccount,
+  onToggleCategory,
+  onSelectRange,
+}) {
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+      <View style={styles.modalOverlay}>
+        <View style={styles.modalCard}>
+          <Text style={styles.modalTitle}>Filter</Text>
+
+          <View style={styles.modalDateRow}>
+            <Pressable style={styles.modalDateCard} onPress={() => onOpenDatePicker("start")}>
+              <View style={styles.modalDateLeft}>
+                <Feather name="calendar" size={18} color="#f4dfd5" />
+                <Text style={styles.modalDateText}>{formatDateLabel(draftStartDate)}</Text>
+              </View>
+            </Pressable>
+
+            <Pressable style={styles.modalDateCard} onPress={() => onOpenDatePicker("end")}>
+              <View style={styles.modalDateLeft}>
+                <Feather name="calendar" size={18} color="#f4dfd5" />
+                <Text style={styles.modalDateText}>{formatDateLabel(draftEndDate)}</Text>
+              </View>
+            </Pressable>
+          </View>
+
+          <View style={styles.rangeRow}>
+            {RANGE_OPTIONS.map((option) => {
+              const isActive = option.key === draftRange;
+              return (
+                <Pressable
+                  key={option.key}
+                  style={[styles.rangeChip, isActive && styles.rangeChipActive]}
+                  onPress={() => onSelectRange(option.key)}
+                >
+                  <Text style={[styles.rangeChipText, isActive && styles.rangeChipTextActive]}>
+                    {option.label}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+
+          <Text style={styles.modalSectionTitle}>Select account</Text>
+          <View style={styles.modalChipWrap}>
+            {accounts.map((account) => {
+              const isActive = draftAccountIds.includes(account.id);
+              return (
+                <Pressable
+                  key={account.id}
+                  style={[styles.modalChip, isActive && styles.modalChipActive]}
+                  onPress={() => onToggleAccount(account.id)}
+                >
+                  <MaterialCommunityIcons
+                    name={account.type === "cash" ? "cash" : "bank-outline"}
+                    size={16}
+                    color={isActive ? "#20120d" : account.color || "#61a6ff"}
+                  />
+                  <Text style={[styles.modalChipText, isActive && styles.modalChipTextActive]}>
+                    {account.name}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+
+          <Text style={styles.modalSectionTitle}>Select category</Text>
+          <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.modalCategoryWrap}>
+            {categories.map((category) => {
+              const isActive = draftCategoryIds.includes(category.id);
+              return (
+                <Pressable
+                  key={category.id}
+                  style={[styles.categoryChip, isActive && styles.categoryChipActive]}
+                  onPress={() => onToggleCategory(category.id)}
+                >
+                  <MaterialCommunityIcons
+                    name={category.icon || "tag"}
+                    size={16}
+                    color={isActive ? "#20120d" : category.color || "#f6b9a5"}
+                  />
+                  <Text style={[styles.categoryChipText, isActive && styles.categoryChipTextActive]}>
+                    {category.name}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </ScrollView>
+
+          <View style={styles.modalFooter}>
+            <Pressable style={styles.cancelButton} onPress={onClose}>
+              <Text style={styles.cancelText}>Cancel</Text>
+            </Pressable>
+            <Pressable style={styles.applyButton} onPress={onApply}>
+              <Text style={styles.applyText}>Apply</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+export default function ReportsScreen() {
+  const navigation = useNavigation();
+  const currentYear = new Date().getFullYear();
+  const currentBounds = getYearBounds(currentYear);
+
+  const [transactions, setTransactions] = useState([]);
+  const [accounts, setAccounts] = useState([]);
+  const [categories, setCategories] = useState([]);
+  const [chartType, setChartType] = useState("bar");
+  const [chartInteraction, setChartInteraction] = useState(null);
+  const [selectedType, setSelectedType] = useState("expense");
+  const [filterVisible, setFilterVisible] = useState(false);
+  const [pickerField, setPickerField] = useState(null);
+  const [selectedPeriodKey, setSelectedPeriodKey] = useState(null);
+
+  const [appliedRange, setAppliedRange] = useState("monthly");
+  const [appliedAccountIds, setAppliedAccountIds] = useState([]);
+  const [appliedCategoryIds, setAppliedCategoryIds] = useState([]);
+  const [appliedStartDate, setAppliedStartDate] = useState(currentBounds.start);
+  const [appliedEndDate, setAppliedEndDate] = useState(currentBounds.end);
+
+  const [draftRange, setDraftRange] = useState("monthly");
+  const [draftAccountIds, setDraftAccountIds] = useState([]);
+  const [draftCategoryIds, setDraftCategoryIds] = useState([]);
+  const [draftStartDate, setDraftStartDate] = useState(currentBounds.start);
+  const [draftEndDate, setDraftEndDate] = useState(currentBounds.end);
+  const [isRequestingReport, setIsRequestingReport] = useState(false);
+  const [isEmailingReport, setIsEmailingReport] = useState(false);
+  const [lastReportUrl, setLastReportUrl] = useState(null);
+  const [generatedReports, setGeneratedReports] = useState([]);
+  const [profileEmail, setProfileEmail] = useState("");
+  const workingApiBaseRef = useRef(null);
+  const chartTooltipOpacity = useRef(new Animated.Value(0)).current;
+  const chartTooltipScale = useRef(new Animated.Value(0.96)).current;
+  const chartTooltipTranslate = useRef(new Animated.ValueXY({ x: 0, y: 8 })).current;
+
+  const callBackendApi = useCallback(
+    async (path, init) => {
+      const preferred = workingApiBaseRef.current ? [workingApiBaseRef.current] : [];
+      const bases = Array.from(new Set([...preferred, ...getApiBaseCandidates()]));
+      let lastNetworkError = null;
+      const attemptedUrls = [];
+
+      for (const base of bases) {
+        try {
+          const targetUrl = `${base}${path}`;
+          attemptedUrls.push(targetUrl);
+          const response = await fetchWithTimeout(targetUrl, init, 8000);
+          workingApiBaseRef.current = base;
+          return { response, base };
+        } catch (error) {
+          lastNetworkError = error;
+        }
+      }
+
+      const configuredBase = process.env.EXPO_PUBLIC_API_URL;
+      const guidance = configuredBase
+        ? `Configured API URL (${configuredBase}) is unreachable from this device.`
+        : "EXPO_PUBLIC_API_URL is not set.";
+
+      throw new Error(
+        `${guidance} Set EXPO_PUBLIC_API_URL to a reachable backend URL. Tried: ${attemptedUrls.join(
+          ", "
+        )}${lastNetworkError?.message ? ` | Last error: ${lastNetworkError.message}` : ""}`
+      );
+    },
+    []
+  );
+
+  const parseBackendJson = useCallback(async ({ response, base, path }) => {
+    const contentType = response?.headers?.get?.("content-type") || "";
+    const rawText = await response.text().catch(() => "");
+    const trimmed = String(rawText || "").trim();
+
+    if (!trimmed) return null;
+
+    if (contentType.includes("text/html") || trimmed.startsWith("<")) {
+      const preview = trimmed.slice(0, 140).replace(/\s+/g, " ");
+      throw new Error(
+        `Backend returned HTML (status ${response.status}) from ${base}${path}. Check EXPO_PUBLIC_API_URL points to your backend and the backend is running. Preview: ${preview}`
+      );
+    }
+
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      const preview = trimmed.slice(0, 140).replace(/\s+/g, " ");
+      throw new Error(
+        `Backend returned non-JSON (status ${response.status}) from ${base}${path}. Preview: ${preview}`
+      );
+    }
+  }, []);
+
+  const fetchReports = useCallback(async (userId) => {
+    if (!userId) return [];
+    try {
+      const path = `/api/reports?limit=50`;
+      const { response, base } = await callBackendApi(path, {
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${(await supabase.auth.getSession()).data.session?.access_token}`,
+        }
+      });
+      const json = await parseBackendJson({ response, base, path });
+
+      if (!response.ok) {
+        throw new Error(json?.error || `Backend error (${response.status}) while loading reports.`);
+      }
+
+      if (!json?.success) {
+        throw new Error(json?.error || "Backend did not return success while loading reports.");
+      }
+
+      return (json?.reports || []).map((item) => ({
+        id: item.id,
+        label: item.label,
+        url: item.report_url,
+        storagePath: item.storage_path,
+        unavailable: false,
+        createdAt: item.created_at,
+        filename: item.filename,
+        emailStatus: item.email_status,
+      }));
+    } catch (error) {
+      console.warn("Failed to load reports via backend bridge:", error);
+      return [];
+    }
+  }, [callBackendApi]);
+
+  const openGeneratedReport = async (reportItem) => {
+    Alert.alert(
+      "Report Options",
+      `Choose an action for: ${reportItem.label}`,
+      [
+        {
+          text: "Open PDF",
+          onPress: async () => {
+            try {
+              let targetUrl = reportItem?.url || null;
+
+              if (!targetUrl && reportItem?.storagePath) {
+                try {
+                  const { data: signedData, error: signedError } = await supabase.storage
+                    .from("reports")
+                    .createSignedUrl(reportItem.storagePath, 60 * 60 * 24);
+
+                  if (signedError) throw signedError;
+                  targetUrl = signedData?.signedUrl || null;
+                } catch (signError) {
+                  console.warn("Could not refresh report link:", signError?.message || signError);
+                }
+              }
+
+              if (targetUrl && reportItem?.id) {
+                setGeneratedReports((current) =>
+                  current.map((item) => (item.id === reportItem.id ? { ...item, url: targetUrl } : item))
+                );
+              }
+
+              if (!targetUrl) {
+                Alert.alert("Unavailable", "This report link expired. Generate it again.");
+                return;
+              }
+
+              await WebBrowser.openBrowserAsync(targetUrl);
+            } catch (error) {
+              handleReportError(error, reportItem);
+            }
+          },
+        },
+        {
+          text: "Email PDF",
+          onPress: async () => {
+            try {
+              const emailTo = (profileEmail || "").trim();
+              if (!emailTo) {
+                throw new Error("Email not found. Please set it in Profile.");
+              }
+
+              const { data: { session } } = await supabase.auth.getSession();
+              if (!session?.access_token) throw new Error("You must be logged in.");
+
+              const path = "/api/email-report";
+              const { response: resp, base } = await callBackendApi(path, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  Authorization: `Bearer ${session.access_token}`,
+                },
+                body: JSON.stringify({
+                  report_id: reportItem.id,
+                  filename: reportItem.filename,
+                  email_to: emailTo,
+                }),
+              });
+
+              const json = await parseBackendJson({ response: resp, base, path });
+              if (!resp.ok || !json?.success) {
+                throw new Error(json?.details || json?.error || `Failed to send email (${resp.status}).`);
+              }
+
+              Alert.alert("Sent", `Report emailed to ${emailTo}`);
+            } catch (err) {
+              Alert.alert("Error", err.message || "Could not email report.");
+            }
+          },
+        },
+        { text: "Cancel", style: "cancel" },
+      ]
+    );
+  };
+
+  const handleReportError = (error, reportItem) => {
+    const rawMessage = String(error?.message || "");
+    const isMissingObject = /object not found|no such file|not found/i.test(rawMessage);
+
+    if (isMissingObject) {
+      setGeneratedReports((current) =>
+        current.map((item) =>
+          item.id === reportItem?.id ? { ...item, unavailable: true, url: null } : item
+        )
+      );
+      Alert.alert(
+        "Report Missing",
+        "This old report file is no longer in storage. Please generate a new report."
+      );
+    } else {
+      Alert.alert("Error", rawMessage || "Could not open report.");
+    }
+  };
+
+  const requestReport = async (
+    payload,
+    labelForHistory,
+    {
+      sendEmail = false,
+      loadingSetter = setIsRequestingReport,
+      successTitle = sendEmail ? "Sent" : "Success",
+      successMessage = sendEmail
+        ? `Report emailed to ${(profileEmail || "").trim() || "your email"}`
+        : "Your report is ready.",
+    } = {}
+  ) => {
+    loadingSetter(true);
+    try {
+      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError || !session?.access_token) {
+        throw new Error("You must be logged in to request a report.");
+      }
+
+      const path = "/api/monthly-report";
+      const { response, base: API_URL } = await callBackendApi(path, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({
+          ...payload,
+          send_email: sendEmail,
+          email_to: sendEmail ? (profileEmail || "").trim() : undefined,
+        }),
+      });
+
+      const json = await parseBackendJson({ response, base: API_URL, path });
+
+      if (!response.ok || !json?.success) {
+        const message =
+          json?.details ||
+          json?.error ||
+          `Request failed (${response.status}).`;
+        throw new Error(message);
+      }
+
+      const reportUrl = json?.report_url || null;
+      const filename = json?.filename || null;
+      const reportId = json?.report_id || null;
+
+      if (reportUrl) {
+        const absoluteUrl = reportUrl.startsWith("http")
+          ? reportUrl
+          : `${API_URL}${reportUrl.startsWith("/") ? "" : "/"}${reportUrl}`;
+
+        setLastReportUrl(absoluteUrl);
+
+        setGeneratedReports((current) => [
+          {
+            id: reportId || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+            label: labelForHistory || "Generated report",
+            url: absoluteUrl,
+            createdAt: json?.created_at || new Date().toISOString(),
+            filename,
+            emailStatus: json?.email_status || (sendEmail ? "success" : "skipped"),
+          },
+          ...current.filter((item) => item.id !== reportId),
+        ]);
+
+        Alert.alert(
+          successTitle,
+          successMessage,
+          sendEmail
+            ? [{ text: "OK", style: "cancel" }]
+            : [
+                {
+                  text: "View PDF",
+                  onPress: async () => {
+                    await WebBrowser.openBrowserAsync(absoluteUrl);
+                  },
+                },
+                {
+                  text: "Email PDF",
+                  onPress: async () => {
+                    try {
+                      const emailTo = (profileEmail || "").trim();
+                      if (!emailTo) {
+                        throw new Error("Email not found. Please set it in Profile.");
+                      }
+
+                      const { data: { session } } = await supabase.auth.getSession();
+                      if (!session?.access_token) {
+                        throw new Error("You must be logged in.");
+                      }
+
+                      const path = "/api/email-report";
+                      const { response: resp, base } = await callBackendApi(path, {
+                        method: "POST",
+                        headers: {
+                          "Content-Type": "application/json",
+                          Authorization: `Bearer ${session.access_token}`,
+                        },
+                        body: JSON.stringify({ report_id: reportId, filename, email_to: emailTo }),
+                      });
+
+                      const j = await parseBackendJson({ response: resp, base, path });
+                      if (!resp.ok || !j?.success) {
+                        throw new Error(j?.details || j?.error || `Failed to send email (${resp.status}).`);
+                      }
+
+                      Alert.alert("Sent", `Report emailed to ${emailTo}`);
+                    } catch (err) {
+                      Alert.alert("Error", err.message || "Could not email report.");
+                    }
+                  },
+                },
+                { text: "OK", style: "cancel" },
+              ]
+        );
+      } else {
+        if (sendEmail && json?.queued) {
+          Alert.alert(
+            "Queued",
+            `Report generation started. It will be emailed to ${(profileEmail || "").trim() || "your email"} shortly.`
+          );
+        } else {
+          Alert.alert(successTitle, successMessage);
+        }
+      }
+    } catch (e) {
+      Alert.alert("Error", e.message || "An error occurred while requesting your report.");
+    } finally {
+      loadingSetter(false);
+    }
+  };
+
+  const buildReportFiltersSnapshot = () => ({
+    range: appliedRange,
+    account_ids: appliedAccountIds,
+    category_ids: appliedCategoryIds,
+    selected_period_key: selectedPeriod?.key || null,
+    selected_period_label: selectedPeriod?.label || null,
+    start_date: formatDateKey(selectedPeriodBounds.start),
+    end_date: formatDateKey(selectedPeriodBounds.end),
+  });
+
+  const buildFilteredReportPayload = () => ({
+    report_label: `filtered-${appliedRange}-${formatDateKey(selectedPeriodBounds.start)}-to-${formatDateKey(
+      selectedPeriodBounds.end
+    )}`,
+    custom_start_date: formatDateKey(selectedPeriodBounds.start),
+    custom_end_date: formatDateKey(selectedPeriodBounds.end),
+    account_ids: appliedAccountIds,
+    category_ids: appliedCategoryIds,
+    filters: buildReportFiltersSnapshot(),
+  });
+
+  const handleRequestMonthlyReport = async () => {
+    const monthStr = selectedPeriod
+      ? selectedPeriod.date.toISOString().substring(0, 7)
+      : new Date().toISOString().substring(0, 7);
+    await requestReport(
+      {
+        month: monthStr,
+        report_label: `month-${monthStr}`,
+        filters: buildReportFiltersSnapshot(),
+      },
+      `Monthly report (${monthStr})`
+    );
+  };
+
+  const handleRequestLast30DaysReport = async () => {
+    const end = new Date();
+    const start = new Date();
+    start.setDate(end.getDate() - 30);
+    const startKey = formatDateKey(start);
+    const endKey = formatDateKey(end);
+
+    await requestReport(
+      {
+        range_days: 30,
+        report_label: `last-30-days-${startKey}-to-${endKey}`,
+        filters: {
+          range: "custom",
+          start_date: startKey,
+          end_date: endKey,
+          preset: "last_30_days",
+        },
+      },
+      "Last 30 days"
+    );
+  };
+
+  const handleEmailFilteredReport = async () => {
+    const emailTo = (profileEmail || "").trim();
+    if (!emailTo) {
+      Alert.alert("Missing email", "Please add your email in Profile before sending reports.");
+      return;
+    }
+
+    if (!periodTransactions.length) {
+      Alert.alert("No data", "There are no transactions in the current filtered report.");
+      return;
+    }
+
+    await requestReport(buildFilteredReportPayload(), `Filtered report (${selectedPeriod?.label || appliedRange})`, {
+      sendEmail: true,
+      loadingSetter: setIsEmailingReport,
+    });
+  };
+
+  const loadData = useCallback(async () => {
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    if (!user) {
+      setTransactions([]);
+      setAccounts([]);
+      setCategories([]);
+      setGeneratedReports([]);
+      setProfileEmail("");
+      return;
+    }
+
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("email")
+      .eq("id", user.id)
+      .maybeSingle();
+    setProfileEmail(((user.email || profile?.email || "") + "").trim());
+
+    const [{ data: txData, error: txError }, { data: accountData }, { data: categoryData }] = await Promise.all([
+      supabase
+        .from("transactions")
+        .select(`
+          *,
+          categories(id,name,icon,color,type),
+          accounts(name),
+          to_account:to_account_id(name)
+        `)
+        .eq("user_id", user.id)
+        .order("date", { ascending: false })
+        .order("created_at", { ascending: false }),
+      supabase.from("accounts").select("id,name,type,color").eq("user_id", user.id).order("created_at"),
+      supabase.from("categories").select("id,name,icon,color,type").eq("user_id", user.id).order("name"),
+    ]);
+
+    if (txError) {
+      console.warn("Could not load reports:", txError.message);
+      setTransactions([]);
+      return;
+    }
+
+    setTransactions(txData || []);
+    setAccounts(accountData || []);
+    setCategories(categoryData || []);
+
+    try {
+      const nextReports = await fetchReports(user.id);
+      setGeneratedReports(nextReports);
+      setLastReportUrl(nextReports[0]?.url || null);
+    } catch (reportError) {
+      console.warn("Could not load stored reports:", reportError?.message || reportError);
+    }
+  }, []);
+
+  useFocusEffect(
+    useCallback(() => {
+      loadData();
+    }, [loadData])
+  );
+
+  const toggleDraftSelection = (value, list, setter) => {
+    setter(list.includes(value) ? list.filter((item) => item !== value) : [...list, value]);
+  };
+
+  const filteredTransactions = useMemo(() => {
+    return transactions.filter((transaction) => {
+      if (
+        transaction.date < formatDateKey(appliedStartDate) ||
+        transaction.date > formatDateKey(appliedEndDate)
+      ) {
+        return false;
+      }
+
+      if (appliedAccountIds.length && !appliedAccountIds.includes(transaction.account_id)) {
+        return false;
+      }
+
+      if (appliedCategoryIds.length && !appliedCategoryIds.includes(transaction.category_id)) {
+        return false;
+      }
+
+      return true;
+    });
+  }, [appliedAccountIds, appliedCategoryIds, appliedEndDate, appliedStartDate, transactions]);
+
+  const availablePeriods = useMemo(
+    () => buildGroupedSeries(filteredTransactions, appliedRange).sort((left, right) => right.date - left.date),
+    [appliedRange, filteredTransactions]
+  );
+
+  const headerPeriods = useMemo(() => {
+    if (availablePeriods.length) {
+      return availablePeriods;
+    }
+
+    return [
+      {
+        key: `fallback-${appliedRange}-${formatDateKey(appliedStartDate)}`,
+        label: buildGroupLabel(appliedStartDate, appliedRange),
+        date: appliedStartDate,
+      },
+    ];
+  }, [appliedRange, appliedStartDate, availablePeriods]);
+
+  useEffect(() => {
+    setSelectedPeriodKey(null);
+  }, [appliedRange, appliedStartDate, appliedEndDate]);
+
+  useEffect(() => {
+    if (!headerPeriods.length) {
+      setSelectedPeriodKey(null);
+      return;
+    }
+
+    const stillExists = headerPeriods.some((period) => period.key === selectedPeriodKey);
+    if (!stillExists) {
+      setSelectedPeriodKey(headerPeriods[0].key);
+    }
+  }, [headerPeriods, selectedPeriodKey]);
+
+  const selectedPeriod = useMemo(
+    () => headerPeriods.find((period) => period.key === selectedPeriodKey) || headerPeriods[0] || null,
+    [headerPeriods, selectedPeriodKey]
+  );
+
+  const periodTransactions = useMemo(() => {
+    if (!selectedPeriod) {
+      return filteredTransactions;
+    }
+
+    const bounds = getGroupBounds(selectedPeriod.date, appliedRange);
+    return filterTransactionsByBounds(filteredTransactions, bounds.start, bounds.end);
+  }, [appliedRange, filteredTransactions, selectedPeriod]);
+
+  const selectedPeriodBounds = useMemo(() => {
+    if (!selectedPeriod) {
+      return { start: appliedStartDate, end: appliedEndDate };
+    }
+
+    return getGroupBounds(selectedPeriod.date, appliedRange);
+  }, [appliedEndDate, appliedRange, appliedStartDate, selectedPeriod]);
+
+  const annualSummary = useMemo(
+    () =>
+      periodTransactions.reduce(
+        (summary, transaction) => {
+          const amount = Number(transaction.amount || 0);
+
+          if (transaction.type === "income") {
+            summary.income += amount;
+          } else if (transaction.type === "expense") {
+            summary.expense += amount;
+          }
+
+          return summary;
+        },
+        { income: 0, expense: 0 }
+      ),
+    [periodTransactions]
+  );
+
+  const groupedSeries = useMemo(
+    () =>
+      buildChartSeriesForRange(
+        periodTransactions,
+        appliedRange,
+        selectedPeriodBounds.start,
+        selectedPeriodBounds.end
+      ),
+    [appliedRange, periodTransactions, selectedPeriodBounds.end, selectedPeriodBounds.start]
+  );
+  const chartSeries = useMemo(
+    () =>
+      buildAdaptiveChartSeries(
+        groupedSeries,
+        appliedRange,
+        selectedPeriodBounds.start,
+        selectedPeriodBounds.end,
+        5
+      ),
+    [appliedRange, groupedSeries, selectedPeriodBounds.end, selectedPeriodBounds.start]
+  );
+
+  const breakdownItems = useMemo(
+    () => buildCategoryBreakdown(periodTransactions, selectedType),
+    [periodTransactions, selectedType]
+  );
+  const chartBreakdownItems = breakdownItems;
+
+  const selectedTypeTotal = breakdownItems.reduce((sum, item) => sum + item.total, 0);
+  const rawMaxChartValue = Math.max(...chartSeries.flatMap((item) => [item.income, item.expense]), 0);
+  const maxChartValue = getNiceChartMax(rawMaxChartValue);
+  const chartTicks = getChartTicks(maxChartValue);
+  const chartWidth = Math.max(CARD_WIDTH - 52, 260);
+  const chartSlotWidth = chartWidth / Math.max(chartSeries.length, 1);
+
+  useEffect(() => {
+    setChartInteraction(null);
+  }, [appliedRange, chartType, selectedPeriodKey, selectedPeriodBounds.end, selectedPeriodBounds.start]);
+
+  const showChartInteraction = useCallback(
+    (touchX, touchY) => {
+      const nextInteraction = getInteractiveChartState({
+        data: chartSeries,
+        chartType,
+        chartWidth,
+        maxValue: maxChartValue,
+        slotWidth: chartSlotWidth,
+        touchX,
+        touchY,
+      });
+
+      if (!nextInteraction) {
+        return;
+      }
+
+      setChartInteraction((current) => {
+        if (!current) {
+          chartTooltipOpacity.stopAnimation();
+          chartTooltipScale.stopAnimation();
+          chartTooltipOpacity.setValue(0);
+          chartTooltipScale.setValue(0.96);
+          Animated.parallel([
+            Animated.spring(chartTooltipOpacity, {
+              toValue: 1,
+              useNativeDriver: true,
+              tension: 180,
+              friction: 16,
+            }),
+            Animated.spring(chartTooltipScale, {
+              toValue: 1,
+              useNativeDriver: true,
+              tension: 180,
+              friction: 16,
+            }),
+          ]).start();
+        }
+
+        chartTooltipTranslate.setValue({
+          x: nextInteraction.tooltipLeft,
+          y: nextInteraction.tooltipTop,
+        });
+
+        return nextInteraction;
+      });
+    },
+    [
+      chartSlotWidth,
+      chartTooltipOpacity,
+      chartTooltipScale,
+      chartTooltipTranslate,
+      chartType,
+      chartWidth,
+      chartSeries,
+      maxChartValue,
+    ]
+  );
+
+  const clearChartInteraction = useCallback(() => {
+    setChartInteraction((current) => {
+      if (current) {
+        chartTooltipOpacity.stopAnimation();
+        chartTooltipScale.stopAnimation();
+        Animated.parallel([
+          Animated.timing(chartTooltipOpacity, {
+            toValue: 0,
+            duration: 120,
+            useNativeDriver: true,
+          }),
+          Animated.timing(chartTooltipScale, {
+            toValue: 0.96,
+            duration: 120,
+            useNativeDriver: true,
+          }),
+        ]).start();
+      }
+
+      return null;
+    });
+  }, [chartTooltipOpacity, chartTooltipScale]);
+
+  const chartPanResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => true,
+        onMoveShouldSetPanResponder: () => true,
+        onPanResponderGrant: (evt) => {
+          showChartInteraction(evt.nativeEvent.locationX, evt.nativeEvent.locationY);
+        },
+        onPanResponderMove: (evt) => {
+          showChartInteraction(evt.nativeEvent.locationX, evt.nativeEvent.locationY);
+        },
+        onPanResponderRelease: clearChartInteraction,
+        onPanResponderTerminate: clearChartInteraction,
+      }),
+    [clearChartInteraction, showChartInteraction]
+  );
+
+  const openCategoryDetails = useCallback(
+    (item) => {
+      if (!item?.categoryId || !item?.category) {
+        return;
+      }
+
+      navigation.navigate("CategoryDetails", { category: item.category });
+    },
+    [navigation]
+  );
+
+  const openFilters = () => {
+    setDraftRange(appliedRange);
+    setDraftAccountIds(appliedAccountIds);
+    setDraftCategoryIds(appliedCategoryIds);
+    setDraftStartDate(appliedStartDate);
+    setDraftEndDate(appliedEndDate);
+    setFilterVisible(true);
+  };
+
+  const applyFilters = () => {
+    const nextStart = draftStartDate <= draftEndDate ? draftStartDate : draftEndDate;
+    const nextEnd = draftEndDate >= draftStartDate ? draftEndDate : draftStartDate;
+
+    setAppliedRange(draftRange);
+    setAppliedAccountIds(draftAccountIds);
+    setAppliedCategoryIds(draftCategoryIds);
+    setAppliedStartDate(nextStart);
+    setAppliedEndDate(nextEnd);
+    setFilterVisible(false);
+  };
+
+  const handleDateChange = (_, selectedDate) => {
+    setPickerField(null);
+    if (!selectedDate) {
+      return;
+    }
+
+    if (pickerField === "start") {
+      setDraftStartDate(selectedDate);
+    } else if (pickerField === "end") {
+      setDraftEndDate(selectedDate);
+    }
+  };
+
+  return (
+    <SafeAreaView style={styles.safeArea} edges={["top"]}>
+      <ScrollView contentContainerStyle={styles.container} showsVerticalScrollIndicator={false}>
+        <View style={styles.yearRow}>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.periodScroll}>
+            {headerPeriods.map((period) => {
+              const isActive = period.key === selectedPeriod?.key;
+
+              return (
+                <Pressable
+                  key={period.key}
+                  style={[styles.yearChip, isActive && styles.yearChipActive]}
+                  onPress={() => setSelectedPeriodKey(period.key)}
+                >
+                  <Text style={[styles.yearChipText, isActive && styles.yearChipTextActive]}>
+                    {period.label}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </ScrollView>
+        </View>
+
+        <View style={styles.balanceCard}>
+          <Text style={styles.balanceLabel}>Total balance</Text>
+          <Text style={styles.balanceValue}>
+            {formatCurrency(annualSummary.income - annualSummary.expense)}
+          </Text>
+
+          <View style={styles.balanceStats}>
+            <View style={[styles.balanceStat, styles.balanceStatIncome]}>
+              <Text style={styles.balanceStatTitle}>Income</Text>
+              <Text style={[styles.balanceStatValue, styles.incomeText]}>
+                {formatCurrency(annualSummary.income)}
+              </Text>
+            </View>
+
+            <View style={[styles.balanceStat, styles.balanceStatExpense]}>
+              <Text style={[styles.balanceStatTitle, styles.expenseText]}>Expense</Text>
+              <Text style={[styles.balanceStatValue, styles.expenseText]}>
+                {formatCurrency(annualSummary.expense)}
+              </Text>
+            </View>
+          </View>
+        </View>
+
+        <View style={styles.chartCard}>
+          <View style={styles.chartHeader}>
+            <View>
+              <Text style={styles.cardTitle}>Reports</Text>
+              <Text style={styles.chartSubTitle}>
+                {selectedPeriod?.label || "No period"} - {appliedRange}
+              </Text>
+            </View>
+
+            <View style={styles.viewToggle}>
+              <Pressable
+                style={[styles.viewButton, chartType === "bar" && styles.viewButtonActive]}
+                onPress={() => setChartType("bar")}
+              >
+                <MaterialCommunityIcons
+                  name="chart-bar"
+                  size={20}
+                  color={chartType === "bar" ? "#20120d" : "#e4cfc4"}
+                />
+              </Pressable>
+              <Pressable
+                style={[styles.viewButton, chartType === "line" && styles.viewButtonActive]}
+                onPress={() => setChartType("line")}
+              >
+                <MaterialCommunityIcons
+                  name="chart-timeline-variant"
+                  size={20}
+                  color={chartType === "line" ? "#20120d" : "#e4cfc4"}
+                />
+              </Pressable>
+            </View>
+          </View>
+
+          {groupedSeries.length === 0 ? (
+            <View style={styles.emptyChart}>
+              <MaterialCommunityIcons name="chart-box-outline" size={40} color="#8f756b" />
+              <Text style={styles.emptyChartText}>No transactions match this filter.</Text>
+            </View>
+          ) : (
+            <>
+              <ScrollView
+                horizontal
+                scrollEnabled={false}
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.chartScroll}
+              >
+                <View>
+                  <View style={styles.chartYAxis}>
+                    {chartTicks.map((value, index) => (
+                      <Text key={`${value}-${index}`} style={styles.axisText}>
+                        {formatYAxisCurrency(value)}
+                      </Text>
+                    ))}
+                  </View>
+                  <View style={styles.chartSvgWrap}>
+                    <View style={{ width: chartWidth, height: CHART_HEIGHT }}>
+                      {chartType === "bar" ? (
+                        <BarChart
+                          data={chartSeries}
+                          chartWidth={chartWidth}
+                          maxValue={maxChartValue}
+                          slotWidth={chartSlotWidth}
+                          interaction={chartInteraction}
+                        />
+                      ) : (
+                        <LineChart
+                          data={chartSeries}
+                          chartWidth={chartWidth}
+                          maxValue={maxChartValue}
+                          slotWidth={chartSlotWidth}
+                          interaction={chartInteraction}
+                        />
+                      )}
+
+                      <View style={styles.chartGestureLayer} {...chartPanResponder.panHandlers} />
+
+                      {chartInteraction ? (
+                        <Animated.View
+                          pointerEvents="none"
+                          style={[
+                            styles.chartTooltip,
+                            {
+                              opacity: chartTooltipOpacity,
+                              transform: [
+                                { translateX: chartTooltipTranslate.x },
+                                { translateY: chartTooltipTranslate.y },
+                                { scale: chartTooltipScale },
+                              ],
+                            },
+                          ]}
+                        >
+                          <Text style={styles.chartTooltipLabel}>
+                            {chartInteraction.item.label || chartInteraction.item.shortLabel || chartInteraction.item.key}
+                          </Text>
+                          <View style={styles.chartTooltipRow}>
+                            <View style={[styles.chartTooltipSwatch, { backgroundColor: "#7dd56c" }]} />
+                            <Text style={styles.chartTooltipText}>Income {formatCurrency(chartInteraction.item.income)}</Text>
+                          </View>
+                          <View style={styles.chartTooltipRow}>
+                            <View style={[styles.chartTooltipSwatch, { backgroundColor: "#f46872" }]} />
+                            <Text style={styles.chartTooltipText}>Expense {formatCurrency(chartInteraction.item.expense)}</Text>
+                          </View>
+                          <Text style={[styles.chartTooltipActive, { color: chartInteraction.activeColor }]}>
+                            Selected {chartInteraction.activeSeries}
+                          </Text>
+                        </Animated.View>
+                      ) : null}
+                    </View>
+                  </View>
+
+                  <View style={[styles.chartLabelsRow, { width: chartWidth }]}>
+                    {chartSeries.map((item) => (
+                      <Text key={item.key} style={[styles.chartLabel, { width: chartSlotWidth }]}>
+                        {item.axisLabel || item.label}
+                      </Text>
+                    ))}
+                  </View>
+                </View>
+              </ScrollView>
+
+              <View style={styles.legendRow}>
+                <View style={styles.legendItem}>
+                  <View style={[styles.legendDot, styles.expenseBar]} />
+                  <Text style={styles.legendText}>Expense</Text>
+                </View>
+                <View style={styles.legendItem}>
+                  <View style={[styles.legendDot, styles.incomeBar]} />
+                  <Text style={styles.legendText}>Income</Text>
+                </View>
+              </View>
+            </>
+          )}
+
+        </View>
+
+        <View style={styles.segmentShell}>
+          {TYPE_OPTIONS.map((type) => {
+            const isActive = selectedType === type;
+            return (
+              <Pressable
+                key={type}
+                style={[styles.segmentButton, isActive && styles.segmentButtonActive]}
+                onPress={() => setSelectedType(type)}
+              >
+                <Text style={[styles.segmentText, isActive && styles.segmentTextActive]}>
+                  {type === "income" ? "Income" : "Expense"}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+
+        <View style={styles.breakdownCard}>
+          <View style={styles.breakdownHeader}>
+            <Text style={styles.breakdownTitle}>
+              {selectedType === "income" ? "Income" : "Expense"}
+            </Text>
+            <Text style={styles.breakdownAmount}>{formatCurrency(selectedTypeTotal)}</Text>
+          </View>
+
+          <DonutChart items={chartBreakdownItems} total={selectedTypeTotal} selectedType={selectedType} />
+
+          {chartBreakdownItems.map((item) => (
+            <Pressable
+              key={`${item.key}-card`}
+              style={styles.breakdownRow}
+              onPress={() => openCategoryDetails(item)}
+              disabled={!item.categoryId || !item.category}
+            >
+              <View style={styles.breakdownLeft}>
+                <View style={[styles.breakdownIcon, { backgroundColor: `${item.color}22` }]}>
+                  <MaterialCommunityIcons name={item.icon} size={18} color={item.color} />
+                </View>
+                <View style={styles.breakdownCopy}>
+                  <Text style={styles.breakdownName}>
+                    {item.name} ({item.percentage.toFixed(1)}%)
+                  </Text>
+                  <Text style={styles.breakdownCount}>{item.count} transactions</Text>
+                </View>
+              </View>
+              <View style={styles.breakdownRight}>
+                <Text style={styles.breakdownValue}>{formatCurrency(item.total)}</Text>
+                <Feather name="chevron-right" size={18} color="#92766d" />
+              </View>
+            </Pressable>
+          ))}
+        </View>
+
+        <View style={styles.reportActionsBottom}>
+          <View style={styles.reportActionsRow}>
+            <Pressable
+              style={[styles.requestReportButton, styles.reportActionPrimary]}
+              onPress={handleRequestLast30DaysReport}
+              disabled={isRequestingReport}
+            >
+              <MaterialCommunityIcons name="calendar-range" size={22} color="#2f1814" />
+              <Text style={styles.requestReportButtonText}>
+                {isRequestingReport ? "Generating..." : "Last 30 days"}
+              </Text>
+            </Pressable>
+
+            <Pressable
+              style={[styles.requestReportButton, styles.reportActionSecondary]}
+              onPress={handleRequestMonthlyReport}
+              disabled={isRequestingReport}
+            >
+              <MaterialCommunityIcons name="file-pdf-box" size={22} color="#2f1814" />
+              <Text style={styles.requestReportButtonText}>
+                {isRequestingReport ? "Generating..." : "This month"}
+              </Text>
+            </Pressable>
+          </View>
+
+          {lastReportUrl ? (
+            <Pressable
+              style={styles.viewReportButton}
+              onPress={async () => {
+                await WebBrowser.openBrowserAsync(lastReportUrl);
+              }}
+            >
+              <MaterialCommunityIcons name="open-in-new" size={22} color="#f4e2d9" />
+              <Text style={styles.viewReportButtonText}>View last generated PDF</Text>
+            </Pressable>
+          ) : null}
+
+          <Pressable
+            style={[styles.viewReportButton, styles.emailReportButton]}
+            onPress={handleEmailFilteredReport}
+            disabled={isEmailingReport || isRequestingReport}
+          >
+            <MaterialCommunityIcons name="email-outline" size={22} color="#2f1814" />
+            <Text style={styles.emailReportButtonText}>
+              {isEmailingReport ? "Sending filtered report..." : "Send filtered report to email"}
+            </Text>
+          </Pressable>
+
+          {generatedReports.length ? (
+            <View style={styles.generatedReportsWrap}>
+              <Text style={styles.generatedReportsTitle}>Generated reports</Text>
+              {generatedReports.map((item) => (
+                <Pressable
+                  key={item.id || item.filename || item.createdAt}
+                  style={styles.generatedReportRow}
+                  onPress={() => openGeneratedReport(item)}
+                >
+                  <MaterialCommunityIcons name="file-pdf-box" size={20} color="#ffb49a" />
+                  <View style={styles.generatedReportCopy}>
+                    <Text style={styles.generatedReportLabel}>{item.label}</Text>
+                    <Text style={styles.generatedReportMeta}>
+                      {new Date(item.createdAt).toLocaleString()} -{" "}
+                      {item.unavailable ? "file missing" : item.emailStatus || "stored"}
+                    </Text>
+                  </View>
+                  <Feather name="chevron-right" size={18} color="#92766d" />
+                </Pressable>
+              ))}
+            </View>
+          ) : null}
+        </View>
+
+      </ScrollView>
+
+      <Pressable style={styles.floatingFilter} onPress={openFilters}>
+        <Feather name="filter" size={22} color="#23120d" />
+      </Pressable>
+
+      <FilterSheet
+        visible={filterVisible}
+        draftAccountIds={draftAccountIds}
+        draftCategoryIds={draftCategoryIds}
+        draftEndDate={draftEndDate}
+        draftRange={draftRange}
+        draftStartDate={draftStartDate}
+        accounts={accounts}
+        categories={categories}
+        onApply={applyFilters}
+        onClose={() => setFilterVisible(false)}
+        onOpenDatePicker={setPickerField}
+        onToggleAccount={(accountId) =>
+          toggleDraftSelection(accountId, draftAccountIds, setDraftAccountIds)
+        }
+        onToggleCategory={(categoryId) =>
+          toggleDraftSelection(categoryId, draftCategoryIds, setDraftCategoryIds)
+        }
+        onSelectRange={setDraftRange}
+      />
+
+      {pickerField ? (
+        <DateTimePicker
+          value={pickerField === "start" ? draftStartDate : draftEndDate}
+          mode="date"
+          display="default"
+          onChange={handleDateChange}
+        />
+      ) : null}
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  safeArea: {
+    flex: 1,
+    backgroundColor: "#1f110d",
+  },
+  container: {
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    paddingBottom: 130,
+  },
+  yearRow: {
+    marginBottom: 10,
+  },
+  periodScroll: {
+    paddingRight: 6,
+    gap: 6,
+  },
+  yearChip: {
+    minWidth: 104,
+    height: 44,
+    borderRadius: 14,
+    backgroundColor: "#6b681c",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 14,
+  },
+  yearChipActive: {
+    backgroundColor: "#ffb69d",
+  },
+  yearChipText: {
+    color: "#f7ebdd",
+    fontSize: 13,
+    fontWeight: "800",
+  },
+  yearChipTextActive: {
+    color: "#2b1914",
+  },
+  balanceCard: {
+    width: CARD_WIDTH,
+    backgroundColor: "#473631",
+    borderRadius: 24,
+    padding: 18,
+    marginBottom: 16,
+  },
+  balanceLabel: {
+    color: "#e9d6ce",
+    fontSize: 15,
+    fontWeight: "700",
+  },
+  balanceValue: {
+    color: "#fff2ed",
+    fontSize: 38,
+    fontWeight: "900",
+    marginTop: 6,
+  },
+  balanceStats: {
+    flexDirection: "row",
+    gap: 12,
+    marginTop: 14,
+  },
+  balanceStat: {
+    flex: 1,
+    borderRadius: 18,
+    padding: 14,
+    borderWidth: 1,
+  },
+  balanceStatIncome: {
+    backgroundColor: "#324229",
+    borderColor: "#4d6a3c",
+  },
+  balanceStatExpense: {
+    backgroundColor: "#4d312f",
+    borderColor: "#6e4341",
+  },
+  balanceStatTitle: {
+    color: "#cde2c4",
+    fontSize: 14,
+    fontWeight: "700",
+  },
+  balanceStatValue: {
+    fontSize: 19,
+    fontWeight: "900",
+    marginTop: 4,
+  },
+  incomeText: {
+    color: "#82d76e",
+  },
+  expenseText: {
+    color: "#f46f74",
+  },
+  chartCard: {
+    backgroundColor: "#382721",
+    borderRadius: 26,
+    padding: 18,
+    marginBottom: 20,
+  },
+  chartHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    marginBottom: 18,
+  },
+  cardTitle: {
+    color: "#f4e5de",
+    fontSize: 18,
+    fontWeight: "800",
+  },
+  chartSubTitle: {
+    color: "#bca59b",
+    fontSize: 12,
+    marginTop: 4,
+  },
+  viewToggle: {
+    flexDirection: "row",
+    gap: 8,
+  },
+  viewButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 12,
+    backgroundColor: "#241510",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  viewButtonActive: {
+    backgroundColor: "#ffb69d",
+  },
+  chartScroll: {
+    paddingBottom: 6,
+  },
+  chartYAxis: {
+    position: "absolute",
+    left: 0,
+    top: 10,
+    bottom: 28,
+    justifyContent: "space-between",
+    zIndex: 2,
+  },
+  chartSvgWrap: {
+    marginLeft: 52,
+    position: "relative",
+  },
+  axisText: {
+    color: "#9c857b",
+    fontSize: 11,
+    fontWeight: "700",
+    width: 44,
+  },
+  chartLabelsRow: {
+    flexDirection: "row",
+    marginLeft: 52,
+    marginTop: 6,
+    alignItems: "flex-start",
+  },
+  chartLabel: {
+    color: "#bda79c",
+    fontSize: 10,
+    textAlign: "center",
+  },
+  chartGestureLayer: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 6,
+  },
+  chartTooltip: {
+    position: "absolute",
+    width: CHART_TOOLTIP_WIDTH,
+    minHeight: CHART_TOOLTIP_HEIGHT,
+    borderRadius: 18,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    backgroundColor: "rgba(29, 18, 13, 0.94)",
+    borderWidth: 1,
+    borderColor: "rgba(255, 194, 171, 0.22)",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.25,
+    shadowRadius: 18,
+    elevation: 6,
+    zIndex: 8,
+  },
+  chartTooltipLabel: {
+    color: "#f7eee8",
+    fontSize: 12,
+    fontWeight: "800",
+    marginBottom: 8,
+  },
+  chartTooltipRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginBottom: 6,
+  },
+  chartTooltipSwatch: {
+    width: 10,
+    height: 10,
+    borderRadius: 99,
+  },
+  chartTooltipText: {
+    color: "#d9c6bd",
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  chartTooltipActive: {
+    marginTop: 2,
+    fontSize: 11,
+    fontWeight: "800",
+    textTransform: "capitalize",
+  },
+  emptyChart: {
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 34,
+  },
+  emptyChartText: {
+    color: "#a98f84",
+    fontSize: 14,
+    marginTop: 10,
+  },
+  legendRow: {
+    flexDirection: "row",
+    gap: 24,
+    marginTop: 10,
+  },
+  legendItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  legendDot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+  },
+  legendText: {
+    color: "#d4beb4",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  expenseBar: {
+    backgroundColor: "#f46872",
+  },
+  incomeBar: {
+    backgroundColor: "#7dd56c",
+  },
+  segmentShell: {
+    flexDirection: "row",
+    backgroundColor: "#2a1813",
+    borderRadius: 28,
+    padding: 6,
+    marginBottom: 18,
+  },
+  segmentButton: {
+    flex: 1,
+    height: 54,
+    borderRadius: 22,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  segmentButtonActive: {
+    backgroundColor: "#ffb69d",
+  },
+  segmentText: {
+    color: "#ead8d0",
+    fontSize: 17,
+    fontWeight: "700",
+  },
+  segmentTextActive: {
+    color: "#291610",
+  },
+  breakdownCard: {
+    backgroundColor: "#382721",
+    borderRadius: 26,
+    padding: 18,
+    marginBottom: 20,
+  },
+  breakdownHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 8,
+  },
+  breakdownTitle: {
+    color: "#f4e6dd",
+    fontSize: 18,
+    fontWeight: "800",
+  },
+  breakdownAmount: {
+    color: "#f7d6c5",
+    fontSize: 18,
+    fontWeight: "900",
+  },
+  donutWrap: {
+    alignItems: "center",
+    justifyContent: "center",
+    marginTop: 10,
+    marginBottom: 32,
+  },
+  donutCenter: {
+    position: "absolute",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  donutCenterLabel: {
+    color: "#e4cec3",
+    fontSize: 14,
+    fontWeight: "700",
+  },
+  donutCenterAmount: {
+    color: "#fff4ee",
+    fontSize: 22,
+    fontWeight: "900",
+    marginTop: 6,
+  },
+  chartCaption: {
+    textAlign: "center",
+    color: "#e2cfc4",
+    fontSize: 13,
+    fontWeight: "700",
+    marginBottom: 14,
+  },
+  breakdownRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    backgroundColor: "#2f1d18",
+    borderRadius: 18,
+    paddingHorizontal: 14,
+    paddingVertical: 14,
+    marginBottom: 14,
+  },
+  breakdownLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    flex: 1,
+    marginRight: 10,
+  },
+  breakdownIcon: {
+    width: 42,
+    height: 42,
+    borderRadius: 15,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 12,
+  },
+  breakdownCopy: {
+    flex: 1,
+  },
+  breakdownName: {
+    color: "#f6e4dc",
+    fontSize: 15,
+    fontWeight: "700",
+  },
+  breakdownCount: {
+    color: "#baa198",
+    fontSize: 13,
+    marginTop: 4,
+  },
+  breakdownRight: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  breakdownValue: {
+    color: "#f7d8ca",
+    fontSize: 15,
+    fontWeight: "800",
+  },
+  floatingFilter: {
+    position: "absolute",
+    right: 20,
+    bottom: 96,
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    backgroundColor: "#ffb69d",
+    alignItems: "center",
+    justifyContent: "center",
+    elevation: 8,
+    shadowColor: "#000",
+    shadowOpacity: 0.25,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 6 },
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.45)",
+    justifyContent: "flex-end",
+  },
+  modalCard: {
+    maxHeight: "90%",
+    backgroundColor: "#2a1a15",
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
+    padding: 18,
+    paddingBottom: 28,
+  },
+  modalTitle: {
+    color: "#f5e3db",
+    fontSize: 22,
+    fontWeight: "800",
+    marginBottom: 18,
+  },
+  modalDateRow: {
+    flexDirection: "row",
+    gap: 10,
+    marginBottom: 16,
+  },
+  modalDateCard: {
+    flex: 1,
+    backgroundColor: "#4a3932",
+    borderRadius: 18,
+    paddingHorizontal: 14,
+    paddingVertical: 16,
+  },
+  modalDateLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  modalDateText: {
+    color: "#f5dfd4",
+    fontSize: 14,
+    fontWeight: "700",
+    flexShrink: 1,
+  },
+  rangeRow: {
+    flexDirection: "row",
+    gap: 8,
+    marginBottom: 18,
+  },
+  rangeChip: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#6b681c",
+    borderRadius: 16,
+    paddingVertical: 12,
+  },
+  rangeChipActive: {
+    backgroundColor: "#ffb69d",
+  },
+  rangeChipText: {
+    color: "#f7ebdd",
+    fontSize: 14,
+    fontWeight: "700",
+  },
+  rangeChipTextActive: {
+    color: "#291610",
+  },
+  modalSectionTitle: {
+    color: "#f0ded5",
+    fontSize: 18,
+    fontWeight: "700",
+    marginBottom: 12,
+  },
+  modalChipWrap: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 10,
+    marginBottom: 18,
+  },
+  modalChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: "#33211d",
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  modalChipActive: {
+    backgroundColor: "#ffb69d",
+  },
+  modalChipText: {
+    color: "#ead6cc",
+    fontSize: 14,
+    fontWeight: "700",
+  },
+  modalChipTextActive: {
+    color: "#291610",
+  },
+  modalCategoryWrap: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 10,
+    paddingBottom: 18,
+  },
+  categoryChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: "#241611",
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  categoryChipActive: {
+    backgroundColor: "#ffb69d",
+  },
+  categoryChipText: {
+    color: "#ead8cf",
+    fontSize: 14,
+    fontWeight: "700",
+  },
+  categoryChipTextActive: {
+    color: "#291610",
+  },
+  modalFooter: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginTop: 12,
+  },
+  cancelButton: {
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+  },
+  cancelText: {
+    color: "#f0c8b7",
+    fontSize: 18,
+    fontWeight: "700",
+  },
+  applyButton: {
+    minWidth: 140,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#7f5849",
+    borderRadius: 18,
+    paddingHorizontal: 24,
+    paddingVertical: 14,
+  },
+  applyText: {
+    color: "#fff4ed",
+    fontSize: 18,
+    fontWeight: "800",
+  },
+  emptyDonut: {
+    alignItems: "center",
+    justifyContent: "center",
+    height: 220,
+  },
+  emptyDonutText: {
+    color: "#a88e84",
+    fontSize: 14,
+    fontWeight: "700",
+    marginTop: 10,
+  },
+  requestReportButton: {
+    backgroundColor: "#ffb49a",
+    borderRadius: 20,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 18,
+    marginTop: 24,
+    gap: 12,
+  },
+  requestReportButtonText: {
+    color: "#2f1814",
+    fontSize: 15,
+    fontWeight: "800",
+  },
+  reportActionsRow: {
+    flexDirection: "row",
+    gap: 10,
+    marginTop: 18,
+  },
+  reportActionsBottom: {
+    marginTop: 18,
+    marginBottom: 18,
+  },
+  reportActionPrimary: {
+    flex: 1,
+  },
+  reportActionSecondary: {
+    flex: 1,
+  },
+  viewReportButton: {
+    marginTop: 12,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: "#3f2a24",
+    backgroundColor: "#251612",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 16,
+    gap: 10,
+  },
+  viewReportButtonText: {
+    color: "#f4e2d9",
+    fontSize: 16,
+    fontWeight: "800",
+  },
+  emailReportButton: {
+    backgroundColor: "#ffcfbf",
+    borderColor: "#ffcfbf",
+  },
+  emailReportButtonText: {
+    color: "#2f1814",
+    fontSize: 16,
+    fontWeight: "800",
+  },
+  generatedReportsWrap: {
+    marginTop: 14,
+    paddingTop: 14,
+    borderTopWidth: 1,
+    borderTopColor: "#3f2a24",
+  },
+  generatedReportsTitle: {
+    color: "#f4e2d9",
+    fontSize: 16,
+    fontWeight: "900",
+    marginBottom: 10,
+  },
+  generatedReportRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    borderRadius: 14,
+    backgroundColor: "#251612",
+    borderWidth: 1,
+    borderColor: "#3f2a24",
+    marginBottom: 10,
+  },
+  generatedReportCopy: {
+    flex: 1,
+  },
+  generatedReportLabel: {
+    color: "#f4e2d9",
+    fontSize: 14,
+    fontWeight: "900",
+  },
+  generatedReportMeta: {
+    color: "#beaaa1",
+    fontSize: 12,
+    fontWeight: "700",
+    marginTop: 2,
+  },
+});
